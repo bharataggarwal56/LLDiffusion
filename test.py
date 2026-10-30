@@ -3,48 +3,34 @@ import os
 
 import numpy as np
 import torch
-import yaml
 from torchvision.io import read_image, write_png
 from torchvision.transforms.functional import convert_image_dtype
 
 import datasets
 from models import DenoisingDiffusion
+from utils.config import DDIM_STEPS, add_common_args, load_config, resolve_resume
 from utils.metrics import metric
 
 
-def parse_args():
+def parse_args_and_config():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--resume", default="", type=str)
+    add_common_args(parser)
+    parser.add_argument("--resume", default="", type=str,
+                        help="Checkpoint path, or 'auto' for the latest in training.out_dir")
     parser.add_argument("-b", "--batch-size", type=int, default=512)
     parser.add_argument("-p", "--patch_size", type=int, nargs="?")
     parser.add_argument("-g", "--grid_r", type=int, default=16)
-    parser.add_argument("-t", "--sampling_timesteps", type=int, default=25)
+    parser.add_argument("-t", "--sampling_timesteps", type=int, default=DDIM_STEPS)
     parser.add_argument("-d", "--dir", default="data/test/results_debug_v2", type=str)
-    parser.add_argument("--seed", default=0, type=int, metavar="N")
+    parser.add_argument("--seed", default=None, type=int, metavar="N")
     parser.add_argument("--correct", action="store_true")
     parser.add_argument("--gray", action="store_true")
     parser.add_argument("--no-patch", action="store_true")
-    return parser.parse_args()
-
-
-def parse_args_and_config():
-    args = parse_args()
-
-    def dict2namespace(config):
-        namespace = argparse.Namespace()
-        for key, value in config.items():
-            if isinstance(value, dict):
-                new_value = dict2namespace(value)
-            else:
-                new_value = value
-            setattr(namespace, key, new_value)
-        return namespace
-
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
-    new_config = dict2namespace(config)
-    return args, new_config
+    args = parser.parse_args()
+    config = load_config(args.config, args.set, args.data_root)
+    if args.seed is None:
+        args.seed = getattr(config, "seed", 0)
+    return args, config
 
 
 def main():
@@ -66,8 +52,9 @@ def main():
     test_loader = dataset.test_loader()
 
     model = DenoisingDiffusion(args, config)
-    if args.resume != "":
-        model.load(args.resume, ema=False)
+    resume = resolve_resume(args.resume, config)
+    if resume != "":
+        model.load(resume, ema=False)
     model.model.eval()
 
     save_root = args.dir
@@ -84,6 +71,7 @@ def main():
             if not os.path.exists(path):
                 image_size = high.shape[-2:]
                 restored = model.restore_single(low, grid_r, image_size, batch_size=args.batch_size)
+                assert torch.isfinite(restored).all(), f"NaN/inf in output for image {name}"
                 restored = convert_image_dtype(restored, dtype=torch.uint8)
                 restored = restored.cpu()
                 write_png(restored, path)

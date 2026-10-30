@@ -3,6 +3,8 @@ from copy import deepcopy
 import torch
 from torch import nn
 
+from utils.hvi import rgb_to_hvi
+
 from ..unet import DiffusionUNet
 from .encoder import DegEncoder
 
@@ -17,6 +19,19 @@ def compute_color_map(x, norm=True):
     return color_map
 
 
+def compute_hvi_map(x, norm=True):
+    """3-channel HVI map (H, V, I) of x; H and V are already in [-1, 1]."""
+    if norm:
+        x = (x + 1) / 2
+    hvi = rgb_to_hvi(x.clip(0, 1))
+    if norm:
+        hvi = torch.cat([hvi[:, :2], hvi[:, 2:] * 2 - 1], dim=1)
+    return hvi
+
+
+COND_MAPS = {"rgb": compute_color_map, "hvi": compute_hvi_map}
+
+
 class DegrationUNet(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -24,6 +39,10 @@ class DegrationUNet(nn.Module):
         config1, config2 = deepcopy(config), deepcopy(config)
 
         self.with_color = getattr(self.config.params, "color", True)
+        self.cond_space = getattr(config.model, "cond_space", "rgb")
+        if self.cond_space not in COND_MAPS:
+            raise ValueError(f"model.cond_space must be one of {list(COND_MAPS)}, "
+                             f"got {self.cond_space!r}")
 
         num_layers = len(config.model.ch_mult)
         block_in_channels = getattr(config.model, "channels", [
@@ -112,7 +131,7 @@ class DegrationUNet(nn.Module):
 
         inputs = [noisy_hr, lr]
         if self.with_color:
-            color_map = compute_color_map(lr)
+            color_map = COND_MAPS[self.cond_space](lr)
             inputs.append(color_map)
         x = torch.cat(inputs, dim=1)
 

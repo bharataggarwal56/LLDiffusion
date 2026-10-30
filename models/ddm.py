@@ -1,12 +1,16 @@
+import math
 import os
+import time
 
 import numpy as np
 import torch
 from loguru import logger
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.functional import pad
 from torchvision.transforms.functional import crop
 from torchvision.utils import save_image
 
+from utils.config import DDIM_STEPS, resolve_resume
 from utils.metrics import calculate_psnr, calculate_ssim
 from utils.optimize import get_optimizer
 from utils.transforms import data_transform, inverse_data_transform
@@ -73,6 +77,18 @@ def patch_e(x, x_cond, model, corners, p_size, batch_size, t, xt):
     return et_output
 
 
+def pad_to_multiple(x, m):
+    """Reflect-pad the bottom/right of x so that H and W are multiples of m."""
+    ph, pw = (-x.shape[-2]) % m, (-x.shape[-1]) % m
+    while ph > 0 or pw > 0:
+        h, w = x.shape[-2:]
+        assert h > 1 and w > 1, "cannot reflect-pad a 1-pixel image"
+        a, b = min(ph, h - 1), min(pw, w - 1)
+        x = pad(x, (0, b, 0, a), mode="reflect")
+        ph, pw = ph - a, pw - b
+    return x
+
+
 def overlapping_grid_indices(x_cond, psize, r=None):
     h, w = x_cond.shape[-2:]
     r = 16 if r is None else r
@@ -92,6 +108,7 @@ def diffusive_sample(x, x_cond, seq, model, b, eta=0., corners=None, p_size=None
         x_grid_mask = torch.zeros_like(x_cond, device=x.device)
         for (hi, wi) in corners:
             x_grid_mask[:, :, hi:hi + p_size, wi:wi + p_size] += 1
+        assert (x_grid_mask > 0).all(), "patch grid leaves part of the image uncovered"
 
     for i, j in zip(reversed(seq), reversed(seq_next)):
         t = (torch.ones(n) * i).to(x.device)
@@ -134,6 +151,7 @@ class DenoisingDiffusion:
 
         self.optimizer = get_optimizer(self.config, self.model.parameters())
         self.epoch, self.step = 0, 0
+        self.lr_scheduler = None
 
         self.betas = compute_betas(
             beta_schedule=config.diffusion.beta_schedule,
@@ -160,7 +178,7 @@ class DenoisingDiffusion:
             if lr_scheduler.name == "MultiStepLR":
                 from torch.optim.lr_scheduler import MultiStepLR
                 kwargs = vars(lr_scheduler.kwargs)
-                self.lr_schduler = MultiStepLR(self.optimizer, **kwargs)
+                self.lr_scheduler = MultiStepLR(self.optimizer, **kwargs)
             else:
                 msg = f"lr_scheduler {lr_scheduler.name} is not implemented"
                 raise NotImplementedError(msg)
@@ -168,7 +186,9 @@ class DenoisingDiffusion:
         self.best_epoch = 0
 
     def load(self, load_path, ema=False):
-        checkpoint = torch.load(load_path, map_location=self.device)
+        # our own checkpoints pickle the argparse config, so weights_only must be off
+        checkpoint = torch.load(load_path, map_location=self.device,
+                                weights_only=False)
 
         if "epoch" not in checkpoint.keys():
             self.logger.info(f"loaded: {load_path} (pretrained)")
@@ -181,7 +201,7 @@ class DenoisingDiffusion:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.ema_helper.load_state_dict(checkpoint["ema_helper"])
 
-        if hasattr(self, "lr_scheduler") and self.lr_scheduler is not None:
+        if self.lr_scheduler is not None:
             state = checkpoint.get("lr_scheduler")
             if state is not None:
                 self.lr_scheduler.load_state_dict(state)
@@ -191,21 +211,55 @@ class DenoisingDiffusion:
         self.logger.info(
             f"loaded {load_path} (epoch {self.epoch}, step {self.step})")
 
+    def _stop_reason(self, max_iters, time_budget_hours, start_time):
+        if max_iters is not None and self.step >= max_iters:
+            return f"max_iters ({max_iters}) reached"
+        if (time_budget_hours is not None
+                and time.time() - start_time >= time_budget_hours * 3600):
+            return f"time budget ({time_budget_hours}h) reached"
+        return None
+
     def train(self, dataset):
         self.logger.info("start training")
         train_loader = dataset.train_loader()
         val_loader = dataset.val_loader()
 
-        if self.args.resume != "":
-            self.load(self.args.resume)
+        resume = resolve_resume(self.args.resume, self.config)
+        if resume != "":
+            self.load(resume)
+        elif self.args.resume == "auto":
+            self.logger.info("--resume auto: no checkpoint found, starting fresh")
 
-        self.logger.info(f"start training from epoch {self.epoch}")
+        tc = self.config.training
+        max_iters = getattr(tc, "max_iters", None)
+        time_budget_hours = getattr(tc, "time_budget_hours", None)
+        ckpt_every = getattr(tc, "ckpt_every", None)
+        log_every = getattr(tc, "log_every", 50)
+        freq_weight = getattr(tc, "freq_loss_weight", 0)
+
+        params = getattr(self.config, "params", {})
+        loss_weights = getattr(params, "loss_weights", None)
+        loss_weights = None if loss_weights is None else dict(vars(loss_weights))
+
+        def weight_of(k):
+            if k.startswith("freq_"):
+                return freq_weight
+            return 1.0 if loss_weights is None else loss_weights[k]
+
+        self.logger.info(
+            f"start training from epoch {self.epoch}, step {self.step} "
+            f"(max_iters={max_iters}, time_budget_hours={time_budget_hours})")
+        start_time = last_log_time = time.time()
         start_epoch = self.epoch
-        for epoch in range(start_epoch, self.config.training.n_epochs):
+        stop = self._stop_reason(max_iters, time_budget_hours, start_time)
+        for epoch in range(start_epoch, tc.n_epochs):
+            if stop:
+                break
             self.epoch = epoch
             total_loss = 0.0
             loss_dict = {}
-            for step, (x, y) in enumerate(train_loader):
+            n_steps = 0
+            for x, y in train_loader:
                 lows, highs = x
                 lows, highs = lows.to(self.device), highs.to(self.device)
                 lows, highs = data_transform(lows), data_transform(highs)
@@ -221,17 +275,14 @@ class DenoisingDiffusion:
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
 
                 loss = compute_loss(self, x, t, e, b)
+                step_terms = {}
                 if isinstance(loss, dict):
-                    params = getattr(self.config, "params", {})
-                    loss_weights = getattr(params, "loss_weights", None)
-                    if loss_weights is None:
-                        loss_weights = {k: 1.0 for k in loss}
-                    else:
-                        loss_weights = dict(vars(loss_weights))
                     for k, v in loss.items():
+                        step_terms[k] = v.item()
                         loss_dict[k] = loss_dict.get(k, 0.0) + v.item()
-                    loss = sum([loss[k] * loss_weights[k] for k in loss])
+                    loss = sum([loss[k] * weight_of(k) for k in loss])
 
+                assert torch.isfinite(loss), f"non-finite loss: {step_terms}"
                 total_loss += loss.item()
 
                 self.optimizer.zero_grad()
@@ -239,19 +290,48 @@ class DenoisingDiffusion:
                 self.optimizer.step()
                 self.ema_helper.update(self.model)
 
-            if hasattr(self, "lr_schduler"):
-                self.lr_schduler.step()
+                n_steps += 1
+                self.step += 1
+                for k, v in step_terms.items():
+                    self.writer.add_scalar(f"iter/{k}", v, self.step)
+                if log_every and self.step % log_every == 0:
+                    now = time.time()
+                    its = log_every / max(now - last_log_time, 1e-9)
+                    last_log_time = now
+                    if torch.cuda.is_available():
+                        mem = f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
+                    else:
+                        mem = "n/a (no cuda)"
+                    self.logger.info(
+                        f"step: {self.step}, loss: {loss.item():.4f}, " + ", ".join(
+                            f"{k}: {v:.4f}" for k, v in step_terms.items())
+                        + f", it/s: {its:.2f}, peak_mem: {mem}")
+                    self.writer.add_scalar("perf/it_per_sec", its, self.step)
+                if ckpt_every and self.step % ckpt_every == 0:
+                    self.save_resumable()
+                stop = self._stop_reason(max_iters, time_budget_hours, start_time)
+                if stop:
+                    break
 
-            loss = total_loss / step
-            loss_dict = {k: v / step for k, v in loss_dict.items()}
+            if n_steps > 0:
+                loss = total_loss / n_steps
+                loss_dict = {k: v / n_steps for k, v in loss_dict.items()}
+                self.logger.info(f"epoch: {epoch}, step: {self.step}, loss: {loss:.4f}, " + ", ".join([
+                    f"{k}: {v:.4f}" for k, v in loss_dict.items()
+                ]))
+                self.writer.add_scalar("train/total_loss", loss, epoch)
+                self.writer.add_scalars("train/loss", loss_dict, epoch)
 
-            self.logger.info(f"epoch: {epoch}, loss: {loss:.2}, " + ", ".join([
-                f"{k}: {v:.2}" for k, v in loss_dict.items()
-            ]))
-            self.writer.add_scalar("train/total_loss", loss, epoch)
-            self.writer.add_scalars("train/loss", loss_dict, epoch)
-
+            if stop:
+                break
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
             self.validate(val_loader)
+
+        # an interrupted epoch is resumed from its start; a finished one from the next
+        self.save("final.pth", epoch=self.epoch if stop else self.epoch + 1)
+        self.logger.info(f"training finished at step {self.step}: "
+                         f"{stop or 'n_epochs reached'}; saved final.pth")
 
     @torch.no_grad()
     def validate(self, data_loader, r=None, save_images=False):
@@ -309,21 +389,29 @@ class DenoisingDiffusion:
         self.model.train(training)
 
     @property
+    def out_dir(self):
+        return getattr(self.config.training, "out_dir", None)
+
+    @property
     def ckpt_root(self):
+        if self.out_dir is not None:
+            return self.out_dir
         return os.path.join(self.workspace, "ckpts")
 
     @property
     def workspace(self):
+        if self.out_dir is not None:
+            return self.out_dir
         return self.config.data.workspace
 
     @property
     def val_root(self):
         return os.path.join(self.workspace, "val")
 
-    def save(self, name=None):
-        epoch = self.epoch
+    def save(self, name=None, epoch=None):
+        epoch = self.epoch + 1 if epoch is None else epoch
         checkpoint = {
-            "epoch": epoch + 1,
+            "epoch": epoch,
             "step": self.step,
             "state_dict": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
@@ -331,17 +419,30 @@ class DenoisingDiffusion:
             "params": self.args,
             "config": self.config
         }
-        if hasattr(self, "lr_schduler"):
-            checkpoint["lr_scheduler"] = self.lr_schduler.state_dict()
+        if self.lr_scheduler is not None:
+            checkpoint["lr_scheduler"] = self.lr_scheduler.state_dict()
 
         if name is None:
-            name = str(epoch + 1) + ".pth"
+            name = str(epoch) + ".pth"
         checkpoint_path = os.path.join(self.ckpt_root, name)
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        torch.save(checkpoint, checkpoint_path)
+        # write-then-rename so a kill mid-save never leaves a corrupt "latest"
+        tmp_path = checkpoint_path + ".tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, checkpoint_path)
+
+    def save_resumable(self):
+        """Mid-training checkpoint; keeps the newest `keep_ckpts` (default 3)."""
+        self.save(f"ckpt-{self.step:08d}.pth", epoch=self.epoch)
+        keep = getattr(self.config.training, "keep_ckpts", 3)
+        old = sorted(f for f in os.listdir(self.ckpt_root)
+                     if f.startswith("ckpt-") and f.endswith(".pth"))
+        for f in old[:-keep]:
+            os.remove(os.path.join(self.ckpt_root, f))
 
     def sample_image(self, x_cond, x, last=True, patch_locs=None, patch_size=None, batch_size=8):
-        skip = self.config.diffusion.num_diffusion_timesteps // self.args.sampling_timesteps
+        steps = getattr(self.args, "sampling_timesteps", DDIM_STEPS)
+        skip = self.config.diffusion.num_diffusion_timesteps // steps
         seq = range(0, self.config.diffusion.num_diffusion_timesteps, skip)
         xs = diffusive_sample(
             x, x_cond, seq, self.model, self.betas, eta=0.,
@@ -366,6 +467,8 @@ class DenoisingDiffusion:
 
         corners = None
         if r is not None:
+            # pad so the stride-r patch grid covers every pixel; cropped back below
+            x_cond = pad_to_multiple(x_cond, math.lcm(p_size, r))
             h_list, w_list = overlapping_grid_indices(x_cond, p_size, r=r)
             corners = [(i, j) for i in h_list for j in w_list]
         else:
@@ -386,5 +489,6 @@ class DenoisingDiffusion:
             x_cond, x, patch_locs=corners, patch_size=p_size, batch_size=batch_size)
 
         x_output = x_output[:, :, :h, :w]
+        assert torch.isfinite(x_output).all(), "restored image contains NaN/inf"
         x_output = inverse_data_transform(x_output)
         return x_output

@@ -207,7 +207,7 @@ class LOL:
             batch_size=self.config.training.batch_size,
             shuffle=True,
             num_workers=self.config.data.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.config.data.num_workers > 0,
             pin_memory=True,
             collate_fn=LOLDataset.collate_fn,
         )

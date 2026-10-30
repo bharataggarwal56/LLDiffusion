@@ -1,0 +1,77 @@
+# LOL experiment config. lol_baseline / lol_hvi / lol_hvi_freq differ ONLY in
+# model.cond_space, training.freq_loss_weight (and out_dir, which names the run).
+seed: 42
+
+data:
+    dataset: LOL
+    # expects <root>/train/{low,high}/<int>.png and <root>/test/{low,high}/<int>.png
+    root: data/sets/LOL
+    workspace: data/logs/lol
+    image_size: 128
+    num_workers: 8
+
+params:
+    loss_weights:
+        noise_loss: 1
+        # perceptual_loss: 0.1
+        image_loss: 0.1
+    fix_epoch: 40000
+    fuse_mode: "cattn"
+    skip_mode: "add"
+    num_deg_fusion: 3
+    deg_ch: 32
+    encoder:
+        ch: 32
+        encoder_attn: True
+        upsample_attn: True
+
+model:
+    name: DegUNet
+    cond_space: hvi   # rgb | hvi
+    in_channels: 9
+    out_ch: 3
+    ch: 64
+    ch_mult: [1, 1, 2, 2, 4, 4]
+    num_res_blocks: 2
+    attn_resolutions: [8]
+    dropout: 0.0
+    ema_rate: 0.999
+    ema: True
+    resamp_with_conv: True
+
+diffusion:
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.02
+    num_diffusion_timesteps: 1000
+
+training:
+    patch_n: 4
+    batch_size: 8
+    n_epochs: 60000
+    n_iters: 2000000       # unused (legacy)
+    max_iters: 100000      # stop at max_iters or time_budget_hours, whichever is first
+    time_budget_hours: 24
+    ckpt_every: 1000       # resumable checkpoint every N iterations, into out_dir
+    keep_ckpts: 3
+    log_every: 50
+    out_dir: outputs/lol_hvi
+    freq_loss_weight: 0   # 0 = off
+    validation_freq: 500
+
+sampling:
+    batch_size: 32
+    last_only: True
+
+optim:
+    weight_decay: 0.000
+    optimizer: Adam
+    lr: 0.0001
+    amsgrad: False
+    eps: 0.00000001
+
+lr_scheduler:
+    name: MultiStepLR
+    kwargs:
+        milestones: [100, 1000, 5000]
+        gamma: 0.5

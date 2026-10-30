@@ -9,3 +9,5 @@ timm
 torch
 torchmetrics
 torchvision
+# Tested upstream with: torch==2.0.1, torchvision==0.15.2 (not enforced; install the
+# build matching your CUDA/CPU setup from https://pytorch.org/get-started/locally/)

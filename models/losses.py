@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 from torch.nn.functional import l1_loss, mse_loss
 
@@ -35,6 +36,22 @@ def twin_loss(model, x0, t, e, b):
     }
 
 
+def freq_loss_terms(pred_noise, noisy_hr, a, hr):
+    """Per-sample L1 on FFT amplitude/phase between the (clamped) x0 implied by
+    pred_noise and hr, weighted by alpha_bar_t so noisy high-t samples barely count."""
+    x0 = (noisy_hr - pred_noise * (1.0 - a).sqrt()) / a.sqrt()
+    x0 = x0.clamp(-1, 1)
+    f_pred = torch.fft.fft2(x0, norm="ortho")
+    f_gt = torch.fft.fft2(hr, norm="ortho")
+    w = a.view(-1)
+    amp = (f_pred.abs() - f_gt.abs()).abs().mean(dim=(1, 2, 3))
+    phase = (f_pred.angle() - f_gt.angle()).abs().mean(dim=(1, 2, 3))
+    return {
+        "freq_amp_loss": (w * amp).mean(),
+        "freq_phase_loss": (w * phase).mean(),
+    }
+
+
 def deg_loss(model, x0, t, e, b, epoch, config):
     a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
     t = t.float()
@@ -42,12 +59,16 @@ def deg_loss(model, x0, t, e, b, epoch, config):
     noisy_hr = hr * a.sqrt() + e * (1.0 - a).sqrt()
 
     inputs = (noisy_hr, lr, hr)
+    with_freq = getattr(config.training, "freq_loss_weight", 0) > 0
     fixed_encoder = getattr(config.params, "fixed_encoder", False) # false
     degradation = getattr(config.params, "degradation", True) # false
     with_deg = degradation and not fixed_encoder
     if not with_deg:
         pred_noise = model(inputs, t)
         noise_loss = mse_loss(pred_noise, e)
+        if with_freq:
+            return {"noise_loss": noise_loss,
+                    **freq_loss_terms(pred_noise, noisy_hr, a, hr)}
         return noise_loss
 
     perceptual = "perceptual_loss" in vars(config.params.loss_weights)
@@ -77,6 +98,9 @@ def deg_loss(model, x0, t, e, b, epoch, config):
     loss_dict = {
         "noise_loss": noise_loss,
     }
+
+    if with_freq:
+        loss_dict.update(freq_loss_terms(pred_noise, noisy_hr, a, hr))
 
     if not fix_encoder:
         pred_lr = inverse_data_transform(pred_lr)

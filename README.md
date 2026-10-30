@@ -39,7 +39,7 @@ pip install -r requirements.txt
 ```
 2. Download the LOL, LOL-v2 dataset 
 
-3. Extract file into folder `data/sets/lol` `data/sets/lol-v2-syn` `data/sets/lol-v2-real`
+3. Extract file into folder `data/sets/LOL` `data/sets/lol-v2-syn` `data/sets/lol-v2-real` (or anywhere, and point `data.root` / `--data-root` at it)
 
 4. Download the checkpoints from our [Link](https://pan.baidu.com/s/1WH_QcFOeVS5W9f6e5mQ4HA?pwd=kfeh).
 
@@ -67,11 +67,25 @@ python train.py --config configs/deg-unet-lol-v2-real.yml
 python train.py --config configs/deg-unet-lol-v2-sys.yml
 ```
 
+## LOL experiments (baseline / HVI / HVI + frequency loss)
+
+```sh
+python train.py --config configs/lol_baseline.yml            # add --resume auto to continue
+python train.py --config configs/lol_hvi.yml
+python train.py --config configs/lol_hvi_freq.yml
+python eval_lol.py --config configs/lol_hvi.yml               # latest ckpt in training.out_dir -> <out_dir>/eval/results.json
+```
+The three configs differ only in `model.cond_space` (rgb | hvi), `training.freq_loss_weight` and `out_dir`.
+Training stops at `training.max_iters` or `training.time_budget_hours` (whichever first), writes a resumable
+`ckpt-<step>.pth` every `training.ckpt_every` iterations and a `final.pth` at the end, all in `training.out_dir`.
+Any config value can be overridden from the CLI, e.g. `--data-root /path/LOL --set training.max_iters=100`.
+Dataset layout: `<data.root>/{train,test}/{low,high}/<integer>.png`.
+
 # Test
 
 1. Test on the LOL dataset 
 ```sh
-python test.py --config configs/deg-unet.yml --resume checkpoints/LOL/best-355-23.32.pth 
+python test.py --config configs/deg-unet-lol.yml --resume checkpoints/LOL/best-355-23.32.pth 
 ```
 2. Test on the LOL-v2-real dataset 
 ```sh
@@ -79,7 +93,7 @@ python test.py --config configs/deg-unet-lol-v2-real.yml --resume checkpoints/lo
 ```
 3. Test on the LOL-v2-synthetic dataset 
 ```sh
-python test.py --config configs/deg-unet-lol-v2-syn.yml --resume checkpoints/lol-v2-syn/best-3999-25.99.pth
+python test.py --config configs/deg-unet-lol-v2-sys.yml --resume checkpoints/lol-v2-syn/best-3999-25.99.pth
 ```
 
 ## Results

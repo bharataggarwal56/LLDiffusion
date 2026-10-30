@@ -6,7 +6,7 @@ from utils.metrics import evaluate
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("dirs", nargs="+")
-    parser.add_argument("--gt", type=str, default="data/sets/LOL/eval15/high")
+    parser.add_argument("--gt", type=str, default="data/sets/LOL/test/high")
     parser.add_argument("--correct", action="store_true")
     parser.add_argument("--gray", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
