@@ -98,7 +98,8 @@ def overlapping_grid_indices(x_cond, psize, r=None):
 
 
 @torch.no_grad()
-def diffusive_sample(x, x_cond, seq, model, b, eta=0., corners=None, p_size=None, batch_size=8):
+def diffusive_sample(x, x_cond, seq, model, b, eta=0., corners=None, p_size=None, batch_size=8,
+                     clip_x0=True):
     n = x.size(0)
     seq_next = [-1] + list(seq[:-1])
     x0_preds = []
@@ -125,6 +126,12 @@ def diffusive_sample(x, x_cond, seq, model, b, eta=0., corners=None, p_size=None
             et = model((xt, x_cond), t)
 
         x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
+        if clip_x0:
+            # At large t a tiny noise error becomes a huge x0 error (divided by sqrt(at)),
+            # which shows up as seed-dependent global colour/exposure drift. Keep x0 in
+            # the data range and re-derive the noise consistent with it.
+            x0_t = x0_t.clamp(-1, 1)
+            et = (xt - x0_t * at.sqrt()) / (1 - at).sqrt()
         x0_preds.append(x0_t)
 
         c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
@@ -448,6 +455,7 @@ class DenoisingDiffusion:
             x, x_cond, seq, self.model, self.betas, eta=0.,
             corners=patch_locs, p_size=patch_size,
             batch_size=batch_size,
+            clip_x0=getattr(self.config.sampling, "clip_x0", True),
         )
         return xs[0][-1] if last else xs
 
@@ -468,7 +476,7 @@ class DenoisingDiffusion:
         corners = None
         if r is not None:
             # pad so the stride-r patch grid covers every pixel; cropped back below
-            x_cond = pad_to_multiple(x_cond, math.lcm(p_size, r))
+            x_cond = pad_to_multiple(x_cond, r)
             h_list, w_list = overlapping_grid_indices(x_cond, p_size, r=r)
             corners = [(i, j) for i in h_list for j in w_list]
         else:
